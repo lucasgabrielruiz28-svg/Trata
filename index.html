@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Extractor de DNI – Policía de Santa Cruz</title>
+
+<!-- Librerías -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/heic2any/dist/heic2any.min.js"></script>
+
+<style>
+  :root{--azul:#0b84ff;--ok:#2ecc71}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial;margin:12px;background:#fafafa;color:#111}
+  h1{font-size:1.1rem;margin:0 0 8px}
+  button{background:var(--azul);color:#fff;border:none;padding:10px 14px;border-radius:8px;margin:4px 6px 4px 0;font-size:1rem;cursor:pointer}
+  button.sec{background:#eee;color:#111}
+  button:disabled{opacity:.6}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 10px}
+  .pill{background:#eef2f7;color:#111;padding:4px 8px;border-radius:6px;margin-left:6px}
+
+  #preview{display:flex;flex-wrap:wrap;gap:8px}
+  .thumb{position:relative;width:100px;height:100px;border:1px solid #d7dbe0;border-radius:6px;overflow:hidden;background:#fff}
+  .thumb img{width:100%;height:100%;object-fit:cover}
+  .badge{position:absolute;left:6px;top:6px;background:var(--azul);color:#fff;font-size:.8rem;padding:2px 6px;border-radius:999px}
+  progress{width:100%;height:10px;margin:8px 0;display:none}
+
+  .row{display:flex;align-items:flex-start;gap:10px;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin:6px 0;background:#fff}
+  .row.done{background:#e8fff0;border-color:var(--ok)}
+  .dni{font-weight:700;min-width:98px}
+  .name{flex:1;white-space:normal;line-height:1.2}
+
+  .modal-back{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center}
+  .modal{background:#fff;border-radius:12px;max-width:460px;width:calc(100% - 28px);padding:16px;box-shadow:0 12px 40px #0006}
+  .modal h2{margin:0 0 8px;font-size:1.05rem}
+</style>
+</head>
+<body>
+  <h1>Extractor de DNI – Policía de Santa Cruz</h1>
+
+  <div class="bar">
+    <input id="inGal" type="file" accept="image/*,.heic,.heif" multiple hidden>
+    <button onclick="inGal.click()">Desde Fotos</button>
+    <button onclick="fromCam()">Desde Cámara</button>
+    <button id="btnProc">Procesar</button>
+    <button id="btnRetry" class="sec">Reintentar</button>
+    <button class="sec" onclick="resetAll()">Borrar</button>
+    <span class="pill" id="det">Detectados: 0</span>
+  </div>
+
+  <div id="preview"></div>
+  <progress id="prog" value="0" max="1"></progress>
+
+  <div class="bar" style="margin-top:4px">
+    <button id="copyAll">Copiar todos</button>
+    <button id="next">Copiar siguiente ▶</button>
+  </div>
+
+  <div id="list"></div>
+
+  <div class="modal-back" id="mb">
+    <div class="modal">
+      <h2>Copiado</h2>
+      <p><strong>DNI:</strong> <span id="mD"></span></p>
+      <p><strong>Pasajero:</strong> <span id="mN"></span></p>
+      <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px">
+        <button class="sec" onclick="mb.style.display='none'">Cerrar</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ====== Config mínima ====== */
+const OCR_TIMEOUT_MS = 12000;      // watchdog por recognize (evita “se agotó el tiempo”)
+const OCR_TIMEOUT_BOOST_MS = 8000; // watchdog en refuerzos
+const MAX_WIDTH = 1400;            // escalado para móviles
+
+/* ====== Estado/UI ====== */
+const inGal=document.getElementById('inGal');
+const preview=document.getElementById('preview');
+const det=document.getElementById('det');
+const prog=document.getElementById('prog');
+const listDiv=document.getElementById('list');
+const mb=document.getElementById('mb'), mD=document.getElementById('mD'), mN=document.getElementById('mN');
+const btnProc=document.getElementById('btnProc');
+const btnRetry=document.getElementById('btnRetry');
+
+let files=[], results=[], idx=0, worker=null;
+
+/* ====== Entrada de imágenes ====== */
+inGal.onchange=()=>addFiles([...inGal.files]);
+function fromCam(){ const i=document.createElement('input'); i.type='file'; i.accept='image/*'; i.capture='environment'; i.onchange=()=>addFiles([...i.files]); i.click(); }
+function addFiles(arr){
+  arr.forEach(f=>{
+    files.push(f);
+    const url=URL.createObjectURL(f);
+    const d=document.createElement('div'); d.className='thumb';
+    d.innerHTML=`<img src="${url}"><div class="badge">0</div>`;
+    preview.appendChild(d);
+  });
+}
+function resetAll(){ files=[]; results=[]; idx=0; preview.innerHTML=''; listDiv.innerHTML=''; det.textContent='Detectados: 0'; }
+
+/* ====== Botones ====== */
+btnProc.onclick=processAll;
+btnRetry.onclick=retryProcess;
+document.getElementById('copyAll').onclick=copyAll;
+document.getElementById('next').onclick=()=>{ if(idx<results.length) copyOne(idx); };
+document.addEventListener('keydown',e=>{ if(e.key==='n'||e.key==='N'){ e.preventDefault(); document.getElementById('next').click(); }});
+
+/* ====== Worker (Tesseract) ====== */
+async function getWorker(){
+  if(worker) return worker;
+  worker = await Tesseract.createWorker({
+    logger: ()=>{}, // sin logs visibles
+    workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/worker.min.js',
+    corePath:   'https://cdn.jsdelivr.net/npm/tesseract.js-core@4/tesseract-core.wasm.js',
+    langPath:   'https://tessdata.projectnaptha.com/4.0.0'
+  });
+  await worker.loadLanguage('spa'); await worker.initialize('spa');
+  await worker.setParameters({ user_defined_dpi: '144' });
+  return worker;
+}
+async function restartWorker(){
+  try{ if(worker?.terminate) await worker.terminate(); }catch{}
+  worker=null; return await getWorker();
+}
+
+/* ====== Watchdog ====== */
+function recognizeWithTimeout(w, canvasOrImg, lang, opts, ms){
+  return new Promise((resolve,reject)=>{
+    let done=false;
+    const timer=setTimeout(()=>{ if(done) return; done=true; reject(new Error('TIMEOUT')); }, ms);
+    w.recognize(canvasOrImg, lang, opts).then(r=>{
+      if(done) return; done=true; clearTimeout(timer); resolve(r);
+    }).catch(err=>{ if(done) return; done=true; clearTimeout(timer); reject(err); });
+  });
+}
+
+/* ====== Proceso ====== */
+async function retryProcess(){ await restartWorker(); await processAll(); }
+
+async function processAll(){
+  if(!files.length) { alert('Agregá fotos (frente y reverso).'); return; }
+  const w=await getWorker();
+  results=[]; idx=0; det.textContent='Procesando…';
+  prog.style.display='block'; prog.value=0; prog.max=files.length;
+
+  const allPages=[];
+  for(let i=0;i<files.length;i++){
+    try{
+      const pageRes = await processOne(files[i], w, i);
+      preview.children[i]?.querySelector('.badge')?.replaceChildren(document.createTextNode(String(pageRes.length)));
+      allPages.push(...pageRes.map(r=>({...r,_page:i})));
+    }catch(err){
+      if(String(err).includes('TIMEOUT')){ await restartWorker(); }
+    }
+    prog.value = i+1;
+    await new Promise(r=>setTimeout(r,0));
+  }
+
+  allPages.sort((a,b)=> a._page - b._page || a._y - b._y);
+  results = mergeSmart([], allPages).map(({dni,name})=>({dni,name,_done:false}));
+
+  det.textContent = 'Detectados: ' + results.length;
+  prog.style.display='none';
+  renderList();
+}
+
+/* ====== Por página: 5 pasadas + refuerzo + plan B corto ====== */
+async function processOne(file, w, pageIndex){
+  const img = await toImage(await safeHeic(file));
+  const base = scale(img, MAX_WIDTH);
+
+  const passes = [
+    {t:160,s:1.00,r:0},
+    {t:175,s:1.15,r:0},
+    {t:175,s:1.00,r:1.0},
+    {t:188,s:1.20,r:-1.0},
+    {t:170,s:1.25,r:0}
+  ];
+
+  const colX = detectDniColumn(binarize(base,170));
+  let out=[];
+
+  for(const v of passes){
+    const prep1 = scale(base, Math.round(base.width*v.s));
+    const prep  = rotate(prep1, v.r); releaseCanvas(prep1);
+    const bw = binarize(prep, v.t); releaseCanvas(prep);
+
+    try{
+      const resA = await recognizeWithTimeout(w, bw, 'spa', { tessedit_pageseg_mode:6 }, OCR_TIMEOUT_MS);
+      const rows = rowsFromWords(resA.data.words, bw.width, bw.height);
+      out = mergeSmart(out, extractByRows(rows, colX));
+      out = mergeSmart(out, extractByText(resA.data.text||''));
+    }catch(err){
+      if(String(err).includes('TIMEOUT')){ await restartWorker(); }
+    }
+    releaseCanvas(bw);
+    await new Promise(r=>setTimeout(r,0));
+  }
+
+  try{
+    const boost = await refineByRows(w, base, colX);
+    out = mergeSmart(out, boost);
+  }catch(err){
+    if(String(err).includes('TIMEOUT')){ await restartWorker(); }
+  }
+
+  // Plan B breve si quedó pobre
+  if (out.length < 5) {
+    const alt = [
+      {t:150,s:1.12,r:0},
+      {t:168,s:1.24,r:0.8},
+      {t:168,s:1.24,r:-0.8}
+    ];
+    for (const v of alt){
+      const prep1 = scale(base, Math.round(base.width*v.s));
+      const prep  = rotate(prep1, v.r); releaseCanvas(prep1);
+      const bw = binarize(prep, v.t); releaseCanvas(prep);
+      try{
+        const resA = await recognizeWithTimeout(w, bw, 'spa', { tessedit_pageseg_mode:6 }, OCR_TIMEOUT_BOOST_MS);
+        const rows = rowsFromWords(resA.data.words, bw.width, bw.height);
+        out = mergeSmart(out, extractByRows(rows, colX));
+        out = mergeSmart(out, extractByText(resA.data.text||''));
+      }catch(err){
+        if(String(err).includes('TIMEOUT')){ await restartWorker(); }
+      }
+      releaseCanvas(bw);
+      await new Promise(r=>setTimeout(r,0));
+    }
+    try{ out = mergeSmart(out, await refineByRows(w, base, colX)); }catch{}
+  }
+
+  out.sort((a,b)=> a._y - b._y);
+  return out.map(({_y,...r})=>({...r,_y}));
+}
+
+/* ====== Refuerzo por renglón ====== */
+async function refineByRows(worker, baseCanvas, colX){
+  const rows = segmentRowsByColumn(baseCanvas, colX);
+  const out=[];
+  for(let i=0;i<rows.length;i++){
+    const {y0,y1}=rows[i];
+    const nameBandRaw = crop(baseCanvas, 0, y0, Math.max(0,colX-36), y1);
+    const dniBand     = crop(baseCanvas, Math.max(0,colX-10), y0, baseCanvas.width, y1);
+    const nameBand    = enhanceNameBand(nameBandRaw);
+
+    const [dni, name] = await Promise.all([
+      (async()=>{ 
+        await worker.setParameters({ tessedit_char_whitelist: "DP0123456789" });
+        try{
+          const r = await recognizeWithTimeout(worker, dniBand, 'spa', { tessedit_pageseg_mode: 7 }, OCR_TIMEOUT_BOOST_MS);
+          const t=(r.data.text||'').replace(/\s+/g,'');
+          const m=/([DP])(\d{7,9})/.exec(t);
+          if(!m) return null;
+          const digits=m[2].slice(-8).replace(/O/g,'0');
+          return /^\d{8}$/.test(digits)?digits:null;
+        }catch{ return null; }
+      })(),
+      (async()=>{
+        try{
+          await worker.setParameters({
+            tessedit_char_whitelist:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÜÑáéíóúüñ ,.'-",
+            preserve_interword_spaces:"1"
+          });
+          const A = await recognizeWithTimeout(worker, nameBand, 'spa', { tessedit_pageseg_mode: 7 }, OCR_TIMEOUT_BOOST_MS);
+          const aText = tidyName(A.data.text||'');
+          await worker.setParameters({
+            tessedit_char_whitelist:"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚÜÑáéíóúüñ ,.'-",
+            preserve_interword_spaces:"1"
+          });
+          const B = await recognizeWithTimeout(worker, nameBand, 'spa+eng', { tessedit_pageseg_mode: 13 }, OCR_TIMEOUT_BOOST_MS);
+          const bText = tidyName(B.data.text||'');
+          return betterName(aText,bText);
+        }catch(e){ return ''; }
+      })()
+    ]);
+
+    if(dni) out.push({dni, name, _y:(y0+y1)/2});
+    if(i%6===0) await new Promise(r=>setTimeout(r,0));
+  }
+  return out;
+}
+
+/* --- Segmentación de renglones --- */
+function segmentRowsByColumn(canvas, colX){
+  const ctx = canvas.getContext('2d');
+  const W=canvas.width, H=canvas.height;
+  const x0 = Math.max(0, colX-120), x1=Math.min(W-1, colX+120);
+  const img = ctx.getImageData(0,0,W,H).data;
+  const rowInk = new Array(H).fill(0);
+  for (let y=0; y<H; y++){
+    let off = (y*W + x0)*4, sum=0;
+    for(let x=x0; x<=x1; x++, off+=4){ if (img[off]===0) sum++; }
+    rowInk[y]=sum;
+  }
+  const rows=[];
+  let inBand=false, start=0;
+  const thr = Math.max(6, Math.round((x1-x0+1)*0.04));
+  for(let y=0;y<H;y++){
+    if(rowInk[y]>=thr && !inBand){ inBand=true; start=y; }
+    if((rowInk[y]<thr || y===H-1) && inBand){
+      const end = (rowInk[y]<thr? y-1 : y);
+      if(end-start>10) rows.push({y0:start, y1:end});
+      inBand=false;
+    }
+  }
+  return rows;
+}
+
+/* --- Realce nombres (rápido) --- */
+function enhanceNameBand(canvas){
+  if(canvas.height>140) return binarize(canvas, 170);
+  const c=document.createElement('canvas');
+  c.width=canvas.width; c.height=canvas.height;
+  const ctx=c.getContext('2d');
+  ctx.drawImage(canvas,0,0);
+
+  const w=c.width,h=c.height;
+  const src=ctx.getImageData(0,0,w,h);
+  const dst=ctx.createImageData(w,h);
+  const s=src.data, d=dst.data;
+
+  function px(x,y){ return (y*w + x)<<2; }
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const p=px(x,y);
+      let r=0,g=0,b=0;
+      for(let j=-1;j<=1;j++){
+        for(let i=-1;i<=1;i++){
+          const q=px(x+i,y+j);
+          const k=(i===0&&j===0)?5:-1;
+          r+=s[q]*k; g+=s[q+1]*k; b+=s[q+2]*k;
+        }
+      }
+      d[p]  = Math.max(0,Math.min(255,r));
+      d[p+1]= Math.max(0,Math.min(255,g));
+      d[p+2]= Math.max(0,Math.min(255,b));
+      d[p+3]= 255;
+    }
+  }
+  ctx.putImageData(dst,0,0);
+
+  const img=ctx.getImageData(0,0,w,h), dd=img.data;
+  for(let i=0;i<dd.length;i+=4){
+    const y = 0.2126*dd[i]+0.7152*dd[i+1]+0.0722*dd[i+2];
+    const v = y>175 ? 255 : (y>145? 200: 0);
+    dd[i]=dd[i+1]=dd[i+2]=v;
+  }
+  ctx.putImageData(img,0,0);
+  return c;
+}
+
+/* --- Utilidades y OCR helpers --- */
+function tidyName(txt){
+  let s = (txt||'').replace(/[·••]/g,'.')
+                   .replace(/\s*\.\s*/g,' ')
+                   .replace(/\s{2,}/g,' ')
+                   .replace(/[
+]+/g,' ')
+                   .trim();
+  return cleanName(s);
+}
+function betterName(a,b){
+  const score = t=>{
+    if(!t) return 0;
+    const words = t.split(/\s+/).filter(x=>/^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ.'-]{2,}$/.test(x));
+    return words.length + (t.includes(',')?0.5:0) + t.length/40;
+  };
+  return score(b) > score(a) ? b : a;
+}
+
+/* ====== Detección columna ====== */
+function detectDniColumn(canvas){
+  const ctx=canvas.getContext('2d'), w=canvas.width, h=canvas.height;
+  const start = Math.floor(w*0.45);
+  const img=ctx.getImageData(0,0,w,h), d=img.data;
+  const col = new Array(w).fill(0);
+  for(let x=start;x<w;x++){
+    let sum=0, off=x*4;
+    for(let y=0;y<h;y++,off+=w*4){ if(d[off]===0) sum++; }
+    col[x]=sum;
+  }
+  let maxX=start, maxV=0;
+  for(let x=start;x<w;x++){ if(col[x]>maxV){ maxV=col[x]; maxX=x; } }
+  return maxX;
+}
+
+/* ====== mergeSmart ====== */
+function mergeSmart(base, add){
+  const byDni = new Map(base.map(x=>[x.dni,x]));
+  for(const rec of add||[]){
+    if(!rec || !/^\d{8}$/.test(rec.dni)) continue;
+    if(byDni.has(rec.dni)){
+      const cur = byDni.get(rec.dni);
+      if(isBetterName(cur.name, rec.name)) cur.name = rec.name;
+      if(cur._y==null && rec._y!=null) cur._y=rec._y;
+      if(cur._page==null && rec._page!=null) cur._page=rec._page;
+    }else{
+      byDni.set(rec.dni, {...rec});
+      base.push(byDni.get(rec.dni));
+    }
+  }
+  base.sort((a,b)=>(a._page??0)-(b._page??0) || (a._y??0)-(b._y??0));
+  return base;
+}
+
+/* ====== Palabras → renglones ====== */
+function rowsFromWords(words, W, H){
+  const rows=[]; const tolY = Math.max(6, Math.round(H*0.012));
+  for(const w of (words||[])){
+    if(!w?.text) continue;
+    const b=w.bbox||{}; const cy=Math.round((b.y0+b.y1)/2);
+    let row = rows.find(r=> Math.abs(r.cy - cy) <= tolY );
+    if(!row){ row={cy, items:[]}; rows.push(row); }
+    row.items.push({txt:w.text, x0:b.x0, x1:b.x1, y0:b.y0, y1:b.y1});
+  }
+  rows.sort((a,b)=>a.cy-b.cy);
+  rows.forEach(r=> r.items.sort((a,b)=>a.x0-b.x0) );
+  return rows;
+}
+
+/* ====== Extraer por filas ====== */
+function extractByRows(rows, colX){
+  const out=[]; let prevName='';
+  for(const r of rows){
+    const cand = findDniInTokens(r.items);
+    if(cand){
+      const dni=cand.dni, xStart=cand.x0;
+      const leftTokens = r.items.filter(it=> it.x1 <= xStart-4 && /[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(it.txt) );
+      let name = cleanName(leftTokens.map(it=>it.txt).join(' '));
+      if(!name && isLikelyName(prevName)) name = cleanName(prevName);
+      out.push({dni, name, _y:r.cy});
+      prevName=''; continue;
+    }
+    const onlyLetters = r.items.every(it=> !/\d/.test(it.txt) );
+    if(onlyLetters){ prevName = r.items.map(it=>it.txt).join(' '); } else { prevName=''; }
+  }
+  return out;
+}
+
+/* ====== Encontrar DNI en tokens ====== */
+function findDniInTokens(tokens){
+  for(let i=0;i<tokens.length;i++){
+    const t = (tokens[i].txt||'').replace(/\s+/g,'');
+    if(/^[DP]$/i.test(t)){
+      let digits=''; let j=i+1;
+      while(j<tokens.length && /[0-9O]+$/.test((tokens[j].txt||'').replace(/\s+/g,'')) && digits.length<8){
+        digits += (tokens[j].txt||'').replace(/[^0-9O]/g,''); j++;
+      }
+      digits = digits.replace(/O/g,'0');
+      if(/^\d{8}$/.test(digits)) return {dni:digits, x0:tokens[i].x0};
+    }
+    if(/^[DP][0-9O]{8,}$/i.test(t)){
+      const digits = t.slice(1).replace(/O/g,'0').slice(0,8);
+      if(/^\d{8}$/.test(digits)) return {dni:digits, x0:tokens[i].x0+8};
+    }
+    if(/^[0-9O]{8,}$/.test(t) && i>0 && /^[DP]$/i.test((tokens[i-1].txt||'').replace(/\s+/g,''))){
+      const digits = t.replace(/O/g,'0').slice(0,8);
+      if(/^\d{8}$/.test(digits)) return {dni:digits, x0:tokens[i-1].x0};
+    }
+  }
+  return null;
+}
+
+/* ====== Fallback lineal ====== */
+function extractByText(text){
+  const out=[]; const lines=(text||'').split(/?
+/).map(x=>x.trim().replace(/\s+/g,' '));
+  let prevName='';
+  for(const ln of lines){
+    const t = ln.replace(/(\d)\s+(\d)/g,'$1$2');
+    const m = /(?:^|\s)[DP]\s*([0-9O]{8})(?!\d)/i.exec(t);
+    if(m){
+      const dni = m[1].replace(/O/g,'0');
+      if(/^\d{8}$/.test(dni)){
+        let left = cleanName(t.slice(0, m.index));
+        if(!left && isLikelyName(prevName)) left = cleanName(prevName);
+        out.push({dni, name:left, _y: out.length? out[out.length-1]._y+0.01 : 0});
+        prevName='';
+      }
+    }else{
+      if(isLikelyName(t)) prevName=t; else prevName='';
+    }
+  }
+  return out;
+}
+
+/* ====== Reglas nombre ====== */
+function isLikelyName(s){
+  if(!s) return false;
+  if(/\d/.test(s)) return false;
+  const letters = s.replace(/[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ ,.'-]/g,'').trim();
+  return letters.length>=3;
+}
+function isBetterName(oldName,newName){
+  if(!newName) return false;
+  if(!oldName) return true;
+  const score = t=> (t||'').split(/\s+/).length + (t||'').length/40 + (t.includes(',')?0.2:0);
+  return score(newName) > score(oldName)+0.2;
+}
+
+/* ====== Limpieza nombre ====== */
+function cleanName(s){
+  if(!s) return '';
+  let x = (' '+s+' ')
+    .replace(/\[[^\]]*\]|\([^\)]*\)|\<[^\>]*\>/g,' ')
+    .replace(/\s\d{1,6}\s*[.\-]?\s/g,' ')
+    .replace(/[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ ,.'-]/g,' ')
+    .replace(/\s{2,}/g,' ').trim();
+
+  x = x.replace(/([A-Za-zÁÉÍÓÚÜÑ])\s*\.\s*/g,'$1. ');
+
+  const hadComma = x.includes(',');
+  x = x.toLowerCase().replace(/([\p{L}\p{M}]+)/gu, w=> w.charAt(0).toUpperCase()+w.slice(1));
+  x = x.replace(/(De|Del|La|Las|Los|Y|E|Da|Dos|Das|Di|Du|Van|Von)/g, m=>m.toLowerCase());
+  x = x.replace(/(San|Santa|Santo)/g, m=>m.charAt(0).toUpperCase()+m.slice(1).toLowerCase());
+
+  const tokens = x.split(/\s+/).filter(Boolean);
+  x = tokens.slice(Math.max(0,tokens.length-7)).join(' ');
+
+  if(hadComma){
+    const p=x.split(','), l=p[0].trim(), r=p.slice(1).join(',').trim();
+    x = l+(r? ', '+r:''); 
+  }
+  return x;
+}
+
+/* ====== Canvas / imagen ====== */
+async function safeHeic(file){
+  const isHeic=/heic|heif/i.test(file.type)||/\.hei[cf]$/i.test(file.name||'');
+  if(!isHeic) return file;
+  try{
+    const b=await heic2any({blob:file,toType:'image/jpeg',quality:0.9});
+    return Array.isArray(b)?b[0]:b;
+  }catch(e){ return file; }
+}
+function toImage(file){return new Promise((res,rej)=>{const img=new Image();img.onload=()=>res(img);img.onerror=()=>rej('No se pudo leer la imagen');img.src=URL.createObjectURL(file);});}
+function scale(imgOrCanvas,maxW=MAX_WIDTH){
+  const w = (imgOrCanvas.width>maxW ? maxW : imgOrCanvas.width);
+  const r = w/imgOrCanvas.width;
+  const c=document.createElement('canvas'); c.width=Math.round(imgOrCanvas.width*r); c.height=Math.round(imgOrCanvas.height*r);
+  const ctx=c.getContext('2d'); ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+  ctx.drawImage(imgOrCanvas,0,0,c.width,c.height); return c;
+}
+function rotate(canvas,deg){
+  if(!deg) return canvas;
+  const rad=deg*Math.PI/180;
+  const sin=Math.abs(Math.sin(rad)), cos=Math.abs(Math.cos(rad));
+  const w=canvas.width, h=canvas.height;
+  const nw=Math.round(w*cos + h*sin), nh=Math.round(w*sin + h*cos);
+  const out=document.createElement('canvas'); out.width=nw; out.height=nh;
+  const ctx=out.getContext('2d'); ctx.translate(nw/2,nh/2); ctx.rotate(rad); ctx.drawImage(canvas,-w/2,-h/2);
+  return out;
+}
+function binarize(canvas,thr=170){
+  const c=document.createElement('canvas'); c.width=canvas.width; c.height=canvas.height;
+  const ctx=c.getContext('2d'); ctx.drawImage(canvas,0,0);
+  const img=ctx.getImageData(0,0,c.width,c.height), d=img.data;
+  for(let i=0;i<d.length;i+=4){
+    const y = 0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2];
+    const v = y>thr ? 255 : 0; d[i]=d[i+1]=d[i+2]=v;
+  }
+  ctx.putImageData(img,0,0); return c;
+}
+function crop(canvas, x0,y0,x1,y1){
+  const w=Math.max(1, x1-x0), h=Math.max(1, y1-y0);
+  const out=document.createElement('canvas'); out.width=w; out.height=h;
+  out.getContext('2d').drawImage(canvas, x0,y0,w,h, 0,0,w,h);
+  return out;
+}
+function releaseCanvas(c){ if(!c) return; try{ c.width=1; c.height=1; }catch{} }
+
+/* ====== Render / Copiado ====== */
+function renderList(){
+  listDiv.innerHTML='';
+  results.forEach((r,i)=>{
+    const row=document.createElement('div'); row.className='row'+(r._done?' done':'');
+    const d=document.createElement('div'); d.className='dni'; d.textContent=r.dni;
+    const n=document.createElement('div'); n.className='name'; n.textContent=r.name||'(sin nombre)';
+    const b=document.createElement('button'); b.textContent=r._done?'Copiado':'Copiar'; b.disabled=r._done;
+    b.onclick=()=>copyOne(i);
+    row.append(d,n,b); listDiv.appendChild(row);
+  });
+}
+async function copyOne(i){
+  const r=results[i]; if(!r) return;
+  try{ await navigator.clipboard.writeText(r.dni); }catch{}
+  r._done=true; renderList(); idx=i+1;
+  mD.textContent=r.dni; mN.textContent=r.name||''; mb.style.display='flex';
+}
+async function copyAll(){
+  if(!results.length) return;
+  const txt=results.map(r=>r.dni).join('\n');
+  try{ await navigator.clipboard.writeText(txt); }catch{}
+  results.forEach(r=>r._done=true); renderList();
+}
+</script>
+</body>
+</html>
